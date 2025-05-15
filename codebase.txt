@@ -1,0 +1,1167 @@
+<setup.py>
+from setuptools import setup
+import os
+import re
+import subprocess
+import sys
+
+# Attempt to find the path to the _ctypes extension module.
+# This is used on macOS to find dylibs like libffi that _ctypes depends on.
+try:
+    import _ctypes
+    CTYPES_PATH = _ctypes.__file__
+except (ImportError, AttributeError):
+    CTYPES_PATH = None
+    print("Warning: _ctypes module not found or its path is inaccessible.", file=sys.stderr)
+
+def find_actual_path_for_dylib(dylib_reference_path, loader_path):
+    """
+    Resolves a dylib reference path (which can be relative like @rpath/ or @loader_path/)
+    to an actual, absolute path on the filesystem.
+
+    This function is crucial for bundling dependencies correctly on macOS,
+    especially when dealing with libraries linked using @rpath or @loader_path.
+
+    Args:
+        dylib_reference_path (str): The reference path to the dylib (e.g., "@rpath/libffi.8.dylib").
+        loader_path (str): The absolute path to the binary/library that loads the dylib.
+
+    Returns:
+        str or None: The resolved absolute real path to the dylib if found, otherwise None.
+    """
+    if not (dylib_reference_path and loader_path):
+        return None
+
+    loader_dir = os.path.dirname(loader_path)
+
+    if dylib_reference_path.startswith('@rpath/'):
+        # @rpath references are resolved by looking up LC_RPATH load commands
+        # in the loader_path binary.
+        try:
+            # Use otool to list load commands.
+            process = subprocess.run(['otool', '-l', loader_path], capture_output=True, text=True, check=True, encoding='utf-8')
+            otool_output_lines = process.stdout.splitlines()
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            print(f"Warning: 'otool -l {loader_path}' failed. This tool is needed to resolve @rpath.", file=sys.stderr)
+            return None
+
+        rpaths = []
+        # Parse otool output for LC_RPATH commands.
+        for i, line in enumerate(otool_output_lines):
+            if "cmd LC_RPATH" in line:
+                try:
+                    path_line = otool_output_lines[i + 2].strip()
+                    if path_line.startswith("path "):
+                        rpath_val = path_line.split(" ", 1)[1].split(" (offset")[0]
+                        # Substitute @loader_path within an rpath value.
+                        rpath_val = rpath_val.replace('@loader_path', loader_dir)
+                        rpaths.append(os.path.normpath(rpath_val))
+                except IndexError:
+                    # Malformed LC_RPATH entry, skip.
+                    continue
+        
+        dylib_name_part = dylib_reference_path.replace('@rpath/', '')
+        # Check each resolved rpath prefix.
+        for rpath_prefix in rpaths:
+            candidate_path = os.path.join(rpath_prefix, dylib_name_part)
+            if os.path.exists(candidate_path):
+                return os.path.realpath(candidate_path) # Return the canonical path.
+        print(f"Warning: Could not resolve @rpath reference '{dylib_reference_path}' for loader '{loader_path}'. Rpaths searched: {rpaths}", file=sys.stderr)
+        return None
+
+    elif dylib_reference_path.startswith('@loader_path/'):
+        # @loader_path is relative to the directory of the loading binary.
+        path_part = dylib_reference_path.replace('@loader_path/', '')
+        candidate_path = os.path.join(loader_dir, path_part)
+        candidate_path = os.path.normpath(candidate_path)
+        if os.path.exists(candidate_path):
+            return os.path.realpath(candidate_path)
+        print(f"Warning: Could not resolve @loader_path reference '{dylib_reference_path}' for loader '{loader_path}'.", file=sys.stderr)
+        return None
+
+    elif os.path.isabs(dylib_reference_path):
+        # If it's an absolute path, just check if it exists.
+        if os.path.exists(dylib_reference_path):
+            return os.path.realpath(dylib_reference_path)
+        else:
+            print(f"Warning: Absolute path '{dylib_reference_path}' for dylib does not exist.", file=sys.stderr)
+            return None
+    else:
+        # Other types of references (e.g., framework paths not starting with @) are not handled here.
+        print(f"Warning: Unhandled dylib reference type: '{dylib_reference_path}'", file=sys.stderr)
+        return None
+
+
+def get_libffi_path(lib_name="libffi.8.dylib"):
+    """
+    Attempts to find the absolute path to a specific libffi dylib
+    that the Python _ctypes module is linked against.
+
+    This is important for py2app to bundle the correct version of libffi
+    that the current Python interpreter uses, preventing crashes related to
+    ABI incompatibilities if the system libffi is different.
+
+    Args:
+        lib_name (str): The specific name of the libffi dylib (e.g., "libffi.8.dylib").
+
+    Returns:
+        str or None: The resolved absolute real path to the libffi dylib if found, otherwise None.
+    """
+    if not CTYPES_PATH: # _ctypes module path couldn't be determined.
+        return None
+
+    try:
+        # Use otool -L to list dynamic library dependencies of _ctypes.so.
+        process = subprocess.run(['otool', '-L', CTYPES_PATH], capture_output=True, text=True, check=True, encoding='utf-8')
+        otool_lines = process.stdout.splitlines()
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        print(f"Warning: 'otool -L {CTYPES_PATH}' failed. Cannot determine {lib_name} path. 'otool' might be missing (Xcode Command Line Tools).", file=sys.stderr)
+        return None
+
+    # Regex to find the libffi line in otool output.
+    lib_pattern = re.compile(r"^\s*([@\w/\.\-]+?" + re.escape(lib_name) + r")\s*\(compatibility version")
+
+    for line in otool_lines:
+        match = lib_pattern.match(line)
+        if match:
+            lib_reference_path = match.group(1)
+            # Resolve the found reference (which might be @rpath/ or @loader_path/).
+            actual_path = find_actual_path_for_dylib(lib_reference_path, CTYPES_PATH)
+            if actual_path:
+                print(f"Found {lib_name} at: {actual_path}", file=sys.stderr)
+                return actual_path
+            else:
+                print(f"Warning: Could not resolve {lib_name} reference '{lib_reference_path}' from _ctypes.so.", file=sys.stderr)
+                
+    print(f"Warning: {lib_name} dependency not found for {CTYPES_PATH} via otool.", file=sys.stderr)
+    
+    # Fallback for Conda environments where libffi might be in sys.prefix/lib.
+    conda_fallback_path = os.path.join(sys.prefix, "lib", lib_name)
+    if os.path.exists(conda_fallback_path):
+        print(f"Info: Using Conda fallback path for {lib_name}: {conda_fallback_path}", file=sys.stderr)
+        return os.path.realpath(conda_fallback_path)
+        
+    return None
+
+NAME = "macos_llm_overlay"
+
+# --- py2app Configuration ---
+
+# Main application script.
+APP = [{
+    'script': f'{NAME}/app.py',
+}]
+
+# Frameworks to explicitly include in the app bundle.
+# This is particularly important for dylibs like libffi.
+frameworks_to_include = []
+libffi_path_resolved = get_libffi_path("libffi.8.dylib") # Attempt to find libffi.8.dylib
+if libffi_path_resolved:
+    frameworks_to_include.append(libffi_path_resolved)
+else:
+    # If specific libffi not found, try a more generic name as a last resort, or warn.
+    libffi_path_resolved_generic = get_libffi_path("libffi.dylib")
+    if libffi_path_resolved_generic:
+        frameworks_to_include.append(libffi_path_resolved_generic)
+        print(f"Warning: libffi.8.dylib not found, but found generic libffi.dylib at {libffi_path_resolved_generic}. Using this one.", file=sys.stderr)
+    else:
+        print(f"CRITICAL WARNING: libffi.8.dylib (and generic libffi.dylib) could not be found. "
+              f"The application will likely fail to run due to missing libffi. "
+              f"Please ensure 'otool' is available (Xcode Command Line Tools) "
+              f"and your Python environment's _ctypes module is correctly linked to libffi.", file=sys.stderr)
+
+# py2app options for building the .app bundle.
+OPTIONS = {
+    'resources': [f'{NAME}/macos_llm_overlay-icon.png'], # Non-code resources to include.
+    'iconfile': f'{NAME}/macos_llm_overlay.icns',   # Application icon.
+    'frameworks': frameworks_to_include,      # Dylibs/frameworks to bundle.
+    'includes': [                             # Python modules to explicitly include.
+        'pyobjc',
+        'WebKit',
+        'Quartz',
+        'imp',
+        'ctypes',
+        'jaraco.text',
+    ],
+    'packages': [ # Python packages to include.
+        NAME
+    ],
+    'plist': { # Contents for the app's Info.plist file.
+        'CFBundleName': NAME,
+        'CFBundleIdentifier': f'com.timehmann.macOSLLMOverlay',
+        'LSUIElement': True,  # Makes the app an agent app (no Dock icon, no menu bar unless explicitly created).
+    },
+    'argv_emulation': False, # Do not emulate command-line arguments.
+}
+
+# --- Setup Function ---
+setup(
+    packages=[NAME], # Discover packages in the NAME directory.
+    app=APP, # For py2app: specifies the main application script.
+    options={'py2app': OPTIONS}, # For py2app: provides build options.
+    setup_requires=['py2app'], # Ensures py2app is available for the setup process.
+)
+</setup.py>
+
+<macos_llm_overlay/config.py>
+"""
+Configuration settings for the macOS LLM Overlay application.
+This file centralizes various parameters like URLs, paths, UI dimensions,
+and hotkey definitions.
+"""
+from Quartz import (
+    kCGEventFlagMaskShift,
+    kCGEventFlagMaskControl,
+    kCGEventFlagMaskAlternate,
+    kCGEventFlagMaskCommand,
+)
+from pathlib import Path
+
+# The website to load in the WebView.
+PROVIDER_URLS = {
+    "ChatGPT": "https://chat.openai.com",
+    "Gemini": "https://gemini.google.com/app",
+    "AIStudio": "https://aistudio.google.com",
+    "Claude": "https://claude.ai/chats",
+    "Grok": "https://grok.com/chat"
+}
+DEFAULT_PROVIDER_NAME = "AIStudio"
+CURRENT_PROVIDER_KEY = "CurrentLLMProvider"
+
+# Filename of the application icon used in the status bar.
+# Resolved to an absolute path in app.py.
+ICON_PATH = "macos_llm_overlay-icon.png"
+
+# Key used to save and load the window's frame (position and size) in UserDefaults.
+FRAME_SAVE_NAME = "OverlayWindowFrame"
+
+# Title for the application, used in menus, etc.
+APP_TITLE = "LLM Overlay App"
+
+# Height of the draggable area at the top of the window.
+DRAG_AREA_HEIGHT = 20
+
+# Mask for modifier keys relevant to the global hotkey.
+# This defines which modifier keys are considered when checking for a hotkey press.
+TOGGLE_KEY_MASK = (
+    kCGEventFlagMaskShift |
+    kCGEventFlagMaskControl |
+    kCGEventFlagMaskAlternate |
+    kCGEventFlagMaskCommand
+)
+
+# Default global hotkey to toggle the window.
+# 'flags' are Quartz CGEventFlags (e.g., kCGEventFlagMaskCommand).
+# 'key' is the virtual keycode (e.g., 49 for Spacebar).
+TOGGLE_KEY = {"flags": kCGEventFlagMaskCommand, "key": 49} # Default to Command + Space
+
+# Initial dimensions for the window if no saved frame is found.
+INITIAL_WIDTH = 800
+INITIAL_HEIGHT = 600
+
+# Directory for storing application logs, including crash reports.
+LOG_DIR = Path.home() / "Library" / "Logs" / "macos-llm-overlay"
+LOG_DIR.mkdir(parents=True, exist_ok=True) # Ensure the log directory exists.
+
+# File path for storing the user-customized global hotkey.
+TOGGLE_FILE = LOG_DIR / "custom_toggle.json"
+</macos_llm_overlay/config.py>
+
+<macos_llm_overlay/window.py>
+from AppKit import NSWindow, NSView, NSApp, NSEventModifierFlagCommand
+
+class AppWindow(NSWindow):
+    """
+    A custom NSWindow subclass that allows for a borderless window with a transparent background.
+    This window can be dragged around the screen by clicking and dragging the top bar.
+    """
+
+    def canBecomeKeyWindow(self):
+        return True
+
+    def keyDown_(self, event):
+        self.delegate().keyDown_(event)
+
+class DragArea(NSView):
+    """
+    A custom NSView subclass that enables window dragging when clicked.
+    This is used for the top bar of the borderless window.
+    """
+    def mouseDown_(self, event):
+        self.window().performWindowDragWithEvent_(event)
+</macos_llm_overlay/window.py>
+
+<macos_llm_overlay/__init__.py>
+</macos_llm_overlay/__init__.py>
+
+<macos_llm_overlay/utils.py>
+import sys
+import traceback
+import functools
+import datetime
+from ApplicationServices import AXIsProcessTrustedWithOptions, kAXTrustedCheckOptionPrompt
+from macos_llm_overlay.config import LOG_DIR
+
+def check_permissions(ask=False):
+    """
+    Checks for macOS accessibility permissions required for global hotkeys.
+
+    Args:
+        ask (bool): If True, the system will prompt the user to grant permissions
+                    if they haven't been granted already. If False, it will
+                    only check the current status without prompting.
+
+    Returns:
+        bool: True if the process has accessibility permissions, False otherwise.
+    """
+    options = {kAXTrustedCheckOptionPrompt: ask}
+    is_trusted = AXIsProcessTrustedWithOptions(options)
+    return is_trusted
+
+def crash_logger(func):
+    """
+    A decorator that wraps a function to catch, log, and re-raise any exceptions.
+
+    Exceptions are logged to stderr and to a timestamped file in the application's
+    log directory (defined by LOG_DIR in config.py).
+
+    Args:
+        func (callable): The function to be wrapped.
+
+    Returns:
+        callable: The wrapped function.
+    """
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        try:
+            return func(*args, **kwargs)
+        except Exception as e:
+            
+            # Generate a unique log file name
+            timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S.%f")
+            log_file_name = f"crash_{func.__name__}_{timestamp}.log"
+            log_file_path = LOG_DIR / log_file_name
+
+            # Get current exception details
+            exc_type, exc_value, exc_traceback = sys.exc_info()
+            tb_lines = traceback.format_exception(exc_type, exc_value, exc_traceback)
+            tb_str = "".join(tb_lines)
+
+            # Prepare the error message
+            error_message_header = f"--- UNHANDLED EXCEPTION IN {func.__name__} ---"
+            current_time_iso = datetime.datetime.now().isoformat()
+            
+            full_error_message = (
+                f"{error_message_header}\n"
+                f"Timestamp: {current_time_iso}\n"
+                f"Function: {func.__name__}\n"
+                f"Args: {args}\n"
+                f"Kwargs: {kwargs}\n"
+                f"Exception Type: {exc_type.__name__ if exc_type else 'N/A'}\n"
+                f"Exception Value: {exc_value}\n"
+                f"--- Traceback ---\n{tb_str}"
+            )
+            
+            # Print to stderr
+            print(f"CRITICAL ERROR: {error_message_header}. See details below and in log file.", file=sys.stderr)
+            sys.stderr.write(full_error_message + "\n")
+            sys.stderr.flush()
+            
+            # Write to log file
+            try:
+                with open(log_file_path, "w", encoding='utf-8') as f:
+                    f.write(full_error_message)
+                print(f"Crash report saved to: {log_file_path}", file=sys.stderr)
+            except IOError as ioe:
+                print(f"CRITICAL ERROR: Could not write crash log to {log_file_path}: {ioe}", file=sys.stderr)
+            
+            # Re-raise the exception
+            raise
+    return wrapper
+</macos_llm_overlay/utils.py>
+
+<macos_llm_overlay/app.py>
+"""
+Main application module for the macOS LLM Overlay.
+This module sets up the application, creates the overlay window,
+manages the WebView, handles global hotkeys, and defines the
+application lifecycle.
+"""
+import os
+import sys
+import objc # PyObjC bridge
+from AppKit import * # Cocoa framework
+from WebKit import * # WebKit framework for WKWebView
+from Quartz import * # Core Graphics framework for event taps, etc.
+from Foundation import * # Foundation framework for NSObject, NSApplication, etc.
+
+from macos_llm_overlay.config import * # Application configuration
+from macos_llm_overlay.window import AppWindow, DragArea
+from macos_llm_overlay.keyboard import load_custom_toggle_key, set_toggle_window, global_toggle_listener
+from macos_llm_overlay.utils import check_permissions, crash_logger
+
+
+class AppEventTapShim(NSObject):
+    """
+    A shim object to bridge the C-style CGEventTap callback with the
+    Objective-C based OverlayAppDelegate instance. The CGEventTap callback
+    needs a C function pointer, which can't directly call methods on an
+    Objective-C instance in a straightforward way with PyObjC's callback mechanisms.
+    This shim holds a reference to the delegate and exposes Objective-C methods
+    that the Python callback function (created by global_toggle_listener) can call.
+    """
+    _delegate_instance = objc.ivar() # Holds the OverlayAppDelegate instance
+
+    def initWithDelegate_(self, delegate_instance):
+        self = objc.super(AppEventTapShim, self).init()
+        if self is None:
+            return None
+        self._delegate_instance = delegate_instance
+        return self
+
+    def window(self):
+        """Provides access to the main window via the delegate."""
+        if self._delegate_instance:
+            return self._delegate_instance.window
+        return None
+
+    @objc.IBAction
+    def hideWindow_(self, sender):
+        """Relays the hideWindow action to the delegate."""
+        if self._delegate_instance:
+            self._delegate_instance.hideWindow_(sender)
+
+    @objc.IBAction
+    def showWindow_(self, sender):
+        """Relays the showWindow action to the delegate."""
+        if self._delegate_instance:
+            self._delegate_instance.showWindow_(sender)
+
+class OverlayAppDelegate(NSObject):
+    """
+    The main application delegate. Handles application lifecycle events,
+    manages the main window, WebView, status bar item, and global event tap.
+    """
+    # --- Instance Variables (ivars) for Objective-C ---
+    window = objc.ivar()      # The main application window (NSWindow)
+    webView = objc.ivar()     # The WebView displaying the content (WKWebView)
+    contentView = objc.ivar() # The main content view of the window (NSView)
+    dragArea = objc.ivar()    # The custom draggable area (DragArea)
+    statusItem = objc.ivar()  # The status bar item (NSStatusItem)
+    
+    eventTap = objc.ivar()        # The CGEventTap for global hotkeys
+    tap_callback_ref = objc.ivar() # Reference to the Python callback for the event tap
+    app_shim = objc.ivar()        # Instance of AppEventTapShim
+    currentProviderName = objc.ivar() # Name of the currently selected LLM provider
+    providerMenu = objc.ivar()    # Submenu for provider selection
+
+    def applicationDidFinishLaunching_(self, notification):
+        """
+        Called when the application has finished launching.
+        This is where the main setup occurs.
+        """
+        app = NSApplication.sharedApplication()
+        # Set as an accessory application: no Dock icon, no main menu bar by default.
+        app.setActivationPolicy_(NSApplicationActivationPolicyAccessory)
+
+        # Check and request Accessibility Permissions for global hotkey
+        initial_permissions_granted = check_permissions(ask=False)
+        self.eventTap = None # Initialize eventTap
+
+        if not initial_permissions_granted:
+            print("INFO: Accessibility permissions not yet granted. Requesting now...")
+            if check_permissions(ask=True): # Prompt user for permissions
+                print("INFO: Accessibility permissions granted in this session. The global hotkey *should* now work. If not, please restart the application.")
+            else:
+                print("WARNING: Accessibility permissions were NOT granted. Global hotkey will NOT work.")
+        else:
+            print("INFO: Accessibility permissions were already granted.")
+
+        # --- Window Setup ---
+        screen_rect = NSScreen.mainScreen().frame()
+        # Load saved window frame or use default
+        saved_frame_str = NSUserDefaults.standardUserDefaults().stringForKey_(FRAME_SAVE_NAME)
+        if saved_frame_str:
+            window_rect = NSRectFromString(saved_frame_str)
+        else:
+            window_rect = NSMakeRect(
+                (screen_rect.size.width - INITIAL_WIDTH) / 2,
+                (screen_rect.size.height - INITIAL_HEIGHT) / 2,
+                INITIAL_WIDTH,
+                INITIAL_HEIGHT
+            )
+
+        self.window = AppWindow.alloc().initWithContentRect_styleMask_backing_defer_(
+            window_rect,
+            NSWindowStyleMaskBorderless | NSWindowStyleMaskResizable, # Borderless, resizable window
+            NSBackingStoreBuffered,
+            False
+        )
+        self.window.setLevel_(NSFloatingWindowLevel) # Keep window above most others
+        self.window.setCollectionBehavior_(
+            NSWindowCollectionBehaviorCanJoinAllSpaces | # Visible on all Spaces
+            NSWindowCollectionBehaviorStationary |      # Doesn't move with Spaces
+            NSWindowCollectionBehaviorFullScreenAuxiliary # Can be shown over full-screen apps
+        )
+        self.window.setReleasedWhenClosed_(False) # Don't deallocate window when closed, just hide
+        self.window.setDelegate_(self)            # Set this class as the window's delegate
+        self.window.setOpaque_(False)             # Allow transparency
+        self.window.setBackgroundColor_(NSColor.clearColor()) # Transparent background
+
+        # --- Custom Content View with Rounded Corners ---
+        content_view_frame = self.window.contentView().bounds()
+        self.contentView = NSView.alloc().initWithFrame_(content_view_frame)
+        self.contentView.setWantsLayer_(True) # Enable layer-backing for rounded corners, etc.
+        if self.contentView.layer():
+            self.contentView.layer().setCornerRadius_(DRAG_AREA_HEIGHT / 2) # Rounded top corners effect
+            self.contentView.layer().setBackgroundColor_(NSColor.whiteColor().CGColor()) # Background for webview content
+            self.contentView.layer().setMasksToBounds_(True) # Clip subviews to rounded corners
+        self.contentView.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable)
+        self.window.setContentView_(self.contentView)
+
+        # --- Draggable Area (Top Bar) ---
+        drag_area_frame = NSMakeRect(
+            0,
+            self.contentView.bounds().size.height - DRAG_AREA_HEIGHT, # Position at the top
+            self.contentView.bounds().size.width,
+            DRAG_AREA_HEIGHT
+        )
+        self.dragArea = DragArea.alloc().initWithFrame_(drag_area_frame)
+        self.dragArea.setBackgroundColor_(NSColor.darkGrayColor()) # Visible drag bar
+        self.dragArea.setAutoresizingMask_(NSViewWidthSizable | NSViewMinYMargin) # Resize with window
+        self.contentView.addSubview_(self.dragArea)
+
+        # --- Close Button ---
+        close_button_size = DRAG_AREA_HEIGHT * 0.75
+        close_button_margin = (DRAG_AREA_HEIGHT - close_button_size) / 2
+        close_button_frame = NSMakeRect(
+            close_button_margin,
+            close_button_margin,
+            close_button_size,
+            close_button_size
+        )
+        closeButton = NSButton.buttonWithTitle_target_action_("✕", self, "hideWindow:")
+        closeButton.setFrame_(close_button_frame)
+        closeButton.setBezelStyle_(NSBezelStyleRegularSquare) # Simple style
+        closeButton.setBordered_(False)
+        closeButton.setFont_(NSFont.systemFontOfSize_(14))
+        closeButton.setAutoresizingMask_(NSViewMaxXMargin | NSViewMinYMargin) # Pin to top-left
+        self.dragArea.addSubview_(closeButton)
+        
+        # --- WebView Setup ---
+        webViewConfig = WKWebViewConfiguration.alloc().init()
+        if webViewConfig.preferences(): # Ensure preferences exist
+            webViewConfig.preferences().setJavaScriptCanOpenWindowsAutomatically_(True)
+
+        web_view_frame = NSMakeRect(
+            0,
+            0, # Position below drag area
+            self.contentView.bounds().size.width,
+            self.contentView.bounds().size.height - DRAG_AREA_HEIGHT # Fill remaining space
+        )
+        self.webView = WKWebView.alloc().initWithFrame_configuration_(web_view_frame, webViewConfig)
+        # Set a common user agent to avoid compatibility issues with websites.
+        self.webView.setCustomUserAgent_("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15")
+        self.webView.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable) # Resize with window
+        # Add webView below the dragArea so dragArea is always on top
+        self.contentView.addSubview_positioned_relativeTo_(self.webView, NSWindowBelow, self.dragArea)
+
+        # --- Load Current Provider ---
+        saved_provider = NSUserDefaults.standardUserDefaults().stringForKey_(CURRENT_PROVIDER_KEY)
+        if saved_provider and saved_provider in PROVIDER_URLS:
+            self.currentProviderName = saved_provider
+        else:
+            self.currentProviderName = DEFAULT_PROVIDER_NAME
+
+        initial_url_string = PROVIDER_URLS.get(self.currentProviderName)
+        if initial_url_string:
+            self._loadURLString_(initial_url_string)
+        else:
+            print(f"ERROR: Default provider URL for '{self.currentProviderName}' not found.", file=sys.stderr)
+
+        # --- Status Bar Item Setup ---
+        self.statusItem = NSStatusBar.systemStatusBar().statusItemWithLength_(NSVariableStatusItemLength)
+        # Load icon for status bar
+        icon_image = NSImage.alloc().initByReferencingFile_(ICON_PATH)
+        if icon_image and icon_image.isValid():
+            icon_image.setSize_((18, 18)) # Standard status bar icon size
+            icon_image.setTemplate_(True)  # Allows macOS to style it (e.g., dark mode)
+            self.statusItem.button().setImage_(icon_image)
+        else:
+            self.statusItem.button().setTitle_("LLM") # Fallback text
+            print(f"Warning: Could not load icon from {ICON_PATH}")
+
+        # --- Status Bar Menu ---
+        statusMenu = NSMenu.alloc().init()
+        
+        # Menu item to toggle window visibility (using Command+Space as a visual cue, not the actual hotkey)
+        toggleMenuItem = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_("Toggle " + APP_TITLE, "toggleWindowVisibility:", " ") 
+        toggleMenuItem.setKeyEquivalentModifierMask_(NSEventModifierFlagCommand) # Makes Cmd+Space show in menu
+        toggleMenuItem.setTarget_(self)
+        statusMenu.addItem_(toggleMenuItem)
+
+        # --- Change Provider Submenu ---
+        self.providerMenu = NSMenu.alloc().init()
+        changeProviderMenuItem = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_("Change Provider", None, "")
+
+        for provider_name in PROVIDER_URLS.keys():
+            item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(provider_name, "changeProvider:", "")
+            item.setTarget_(self)
+            self.providerMenu.addItem_(item)
+
+        changeProviderMenuItem.setSubmenu_(self.providerMenu)
+        statusMenu.addItem_(changeProviderMenuItem)
+        self._updateProviderMenuChecks() # Set initial checkmark
+
+        # Menu item to open the "Set Hotkey" dialog
+        setToggleMenuItem = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_("Set Toggle Hotkey...", "openSetToggleWindow:", "")
+        setToggleMenuItem.setTarget_(self)
+        statusMenu.addItem_(setToggleMenuItem)
+        
+        statusMenu.addItem_(NSMenuItem.separatorItem()) # Separator
+        
+        # Menu item to quit the application
+        quitMenuItem = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_("Quit " + APP_TITLE, "terminate:", "q")
+        statusMenu.addItem_(quitMenuItem)
+        
+        self.statusItem.setMenu_(statusMenu)
+
+        # --- Global Hotkey (Event Tap) Setup ---
+        self.app_shim = AppEventTapShim.alloc().initWithDelegate_(self)
+        
+        load_custom_toggle_key() # Load user-defined hotkey if it exists
+        # Get the Python callback function for the event tap
+        self.tap_callback_ref = global_toggle_listener(self.app_shim)
+
+        # Create the actual CGEventTap
+        self.eventTap = CGEventTapCreate(
+            kCGSessionEventTap,      # Listen to system-wide events
+            kCGHeadInsertEventTap,   # Insert tap at the head of the event stream
+            kCGEventTapOptionDefault, # Default behavior for the tap
+            CGEventMaskBit(kCGEventKeyDown), # Listen for key down events
+            self.tap_callback_ref,   # The callback function
+            None                     # User data (not used here)
+        )
+
+        if not self.eventTap:
+            print("ERROR: Failed to create CGEventTap. Global hotkey will NOT work.")
+            if not check_permissions(ask=False): # Re-check permissions if tap creation fails
+                print("ERROR: Accessibility permissions are likely still missing or were denied.")
+            else:
+                print("ERROR: Event tap creation failed even with permissions. Other issue might be present (e.g., another app has exclusive tap).")
+        else:
+            # Add the event tap to the current run loop to receive events
+            runLoopSource = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, self.eventTap, 0)
+            CFRunLoopAddSource(CFRunLoopGetCurrent(), runLoopSource, kCFRunLoopCommonModes)
+            CGEventTapEnable(self.eventTap, True) # Enable the event tap
+            print(f"INFO: Global hotkey listener enabled. Current Toggle: {TOGGLE_KEY}")
+
+        self.showWindow_(None) # Show the window on launch
+
+    def _loadURLString_(self, url_string):
+        """Helper to load a URL string into the webView."""
+        url = NSURL.URLWithString_(url_string)
+        request = NSURLRequest.requestWithURL_(url)
+        self.webView.loadRequest_(request)
+
+    @objc.IBAction
+    def showWindow_(self, sender):
+        """Shows the main application window."""
+        if self.window:
+            if not self.window.isVisible():
+                # Restore previous frame if available, otherwise it uses its current frame (set during init)
+                saved_frame_str = NSUserDefaults.standardUserDefaults().stringForKey_(FRAME_SAVE_NAME)
+                if saved_frame_str:
+                    self.window.setFrame_display_(NSRectFromString(saved_frame_str), True)
+
+            self.window.makeKeyAndOrderFront_(None) # Bring to front and make key window
+            NSApp.activateIgnoringOtherApps_(True)   # Ensure app becomes active
+            self.window.makeFirstResponder_(self.webView) # Focus the webview for input
+
+    @objc.IBAction
+    def hideWindow_(self, sender):
+        """Hides the main application window and saves its frame."""
+        if self.window and self.window.isVisible():
+            # Save current window frame (position and size)
+            NSUserDefaults.standardUserDefaults().setObject_forKey_(
+                NSStringFromRect(self.window.frame()), # Convert NSRect to NSString for saving
+                FRAME_SAVE_NAME
+            )
+            NSUserDefaults.standardUserDefaults().synchronize() # Ensure data is written
+            self.window.orderOut_(None) # Hide the window
+
+    @objc.IBAction
+    def toggleWindowVisibility_(self, sender):
+        """Toggles the visibility of the main window."""
+        if self.window.isVisible():
+            self.hideWindow_(None)
+        else:
+            self.showWindow_(None)
+
+    @objc.IBAction
+    def openSetToggleWindow_(self, sender):
+        """Initiates the UI for setting a new global hotkey."""
+        set_toggle_window(self) # Calls the function from keyboard.py
+        print("INFO: 'Set New Global Hotkey' initiated.")
+    
+    @objc.IBAction
+    def changeProvider_(self, sender):
+        """Handles selection of a new LLM provider from the menu."""
+        new_provider_name = sender.title()
+        if new_provider_name in PROVIDER_URLS:
+            self.currentProviderName = new_provider_name
+            NSUserDefaults.standardUserDefaults().setObject_forKey_(self.currentProviderName, CURRENT_PROVIDER_KEY)
+            NSUserDefaults.standardUserDefaults().synchronize()
+
+            url_to_load = PROVIDER_URLS[self.currentProviderName]
+            self._loadURLString_(url_to_load)
+            print(f"Changed provider to: {self.currentProviderName}, loading: {url_to_load}")
+            self._updateProviderMenuChecks()
+        else:
+            print(f"Error: Unknown provider selected '{new_provider_name}'", file=sys.stderr)
+
+    def _updateProviderMenuChecks(self):
+        """Updates checkmarks in the provider selection submenu."""
+        if self.providerMenu and self.currentProviderName:
+            for item in self.providerMenu.itemArray():
+                is_current = (item.title() == self.currentProviderName)
+                item.setState_(NSOnState if is_current else NSOffState)
+
+    # --- NSWindowDelegate Methods ---
+    def windowShouldClose_(self, sender):
+        """Called when the window's close button (if it had one) is clicked."""
+        self.hideWindow_(None) # Hide instead of closing
+        return False # Prevent actual closing
+
+    def windowDidResize_(self, notification):
+        """Called after the window has been resized. Save the new frame."""
+        if self.window:
+            NSUserDefaults.standardUserDefaults().setObject_forKey_(
+                NSStringFromRect(self.window.frame()),
+                FRAME_SAVE_NAME
+            )
+            NSUserDefaults.standardUserDefaults().synchronize()
+
+    def windowDidMove_(self, notification):
+        """Called after the window has been moved. Save the new frame."""
+        if self.window:
+            NSUserDefaults.standardUserDefaults().setObject_forKey_(
+                NSStringFromRect(self.window.frame()),
+                FRAME_SAVE_NAME
+            )
+            NSUserDefaults.standardUserDefaults().synchronize()
+    
+    def windowWillClose_(self, notification):
+        """
+        Called when the window is about to be closed (e.g., during app termination).
+        Perform cleanup here.
+        """
+        # Disable and release the event tap
+        if self.eventTap:
+            CGEventTapEnable(self.eventTap, False)
+            # CFMachPortInvalidate(self.eventTap) # Invalidate the mach port
+            # CFRelease(self.eventTap) # Release the tap reference. Note: PyObjC might handle some CF object releases.
+            self.eventTap = None # Clear the reference
+            print("Global event tap disabled.")
+        
+        # Save window state one last time
+        if self.window and self.window.isVisible():
+             NSUserDefaults.standardUserDefaults().setObject_forKey_(
+                NSStringFromRect(self.window.frame()),
+                FRAME_SAVE_NAME
+            )
+        NSUserDefaults.standardUserDefaults().synchronize()
+        print("Window state saved before closing.")
+
+    def applicationWillTerminate_(self, notification):
+        """Called when the application is about to terminate."""
+        print("Application will terminate.")
+        self.windowWillClose_(notification) # Perform window cleanup
+        if self.app_shim: # Clear shim reference
+            self.app_shim = None
+
+    def keyDown_(self, event):
+        modifiers = event.modifierFlags()
+        key_command = modifiers & NSEventModifierFlagCommand
+        key = event.charactersIgnoringModifiers()
+        if key_command and key == 'q':
+            NSApp.terminate_(None)
+        elif key == 'c':
+            self.window.firstResponder().copy_(None)
+        elif key == 'v':
+            self.window.firstResponder().paste_(None)
+        if key == 'a':
+            self.window.firstResponder().selectAll_(None)
+        elif key == 'x':
+            self.window.firstResponder().cut_(None)
+
+
+@crash_logger # Decorator to log any unhandled exceptions in main()
+def main():
+    """Main function to start the application."""
+    print("Starting OverlayApp.")
+    # Initial permission check (primarily for logging, actual request happens in delegate)
+    permissions_granted = check_permissions(ask=False)
+    if not permissions_granted:
+        print("Accessibility permissions not yet granted. Global hotkey might require them. App will attempt to request if needed for event tap.")
+        
+    # --- Resolve ICON_PATH to an absolute path ---
+    global ICON_PATH
+    if not os.path.isabs(ICON_PATH):
+        resolved_path = None
+        # Try to find it relative to the package directory (if installed)
+        try:
+            import macos_llm_overlay
+            package_dir = os.path.dirname(macos_llm_overlay.__file__)
+            candidate = os.path.join(package_dir, ICON_PATH)
+            if os.path.exists(candidate):
+                resolved_path = candidate
+        except ImportError:
+            pass 
+
+        # If not found, try relative to the script's directory (useful for development)
+        if resolved_path is None:
+            script_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
+            bundle = NSBundle.mainBundle()
+            if bundle:
+                res_path = bundle.resourcePath()
+                if res_path:
+                    candidate_bundle_path = os.path.join(res_path, ICON_PATH)
+                    if os.path.exists(candidate_bundle_path):
+                        resolved_path = candidate_bundle_path
+
+            if resolved_path is None: # Fallback if bundle method fails or not in bundle
+                 resolved_path = os.path.join(script_dir, ICON_PATH) # For direct script execution
+                 if not os.path.exists(resolved_path) and "../Resources" in script_dir: # A guess for script within a bundle structure
+                    resolved_path = os.path.join(os.path.dirname(script_dir), "Resources", ICON_PATH)
+
+
+        ICON_PATH = os.path.realpath(resolved_path) # Use canonical path
+    print(f"Resolved ICON_PATH to: {ICON_PATH}")
+
+    # --- Application Setup & Run ---
+    app = NSApplication.sharedApplication()
+    delegate = OverlayAppDelegate.alloc().init()
+    app.setDelegate_(delegate)
+    app.run() # Start the main event loop
+
+if __name__ == "__main__":
+    main()
+</macos_llm_overlay/app.py>
+
+<macos_llm_overlay/keyboard.py>
+"""
+Handles global keyboard event listening (hotkeys) and the UI for
+setting a custom hotkey for the application.
+"""
+import json
+import sys
+import objc
+import traceback
+from AppKit import (
+    NSView, NSColor, NSTextField, NSTextAlignmentCenter,
+    NSFont, NSMakeRect, NSEvent, NSWindowAbove,
+    NSViewWidthSizable, NSViewHeightSizable,
+    NSViewMinXMargin, NSViewMaxXMargin, NSViewMinYMargin, NSViewMaxYMargin,
+    NSTimer
+)
+from Foundation import NSObject
+from Quartz import (
+    CGEventGetIntegerValueField, kCGKeyboardEventKeycode, CGEventGetFlags,
+    kCGEventKeyDown,
+    kCGEventFlagMaskShift, kCGEventFlagMaskControl,
+    kCGEventFlagMaskAlternate, kCGEventFlagMaskCommand
+)
+
+from macos_llm_overlay.config import TOGGLE_KEY, TOGGLE_KEY_MASK, TOGGLE_FILE
+
+# Mapping of virtual keycodes to human-readable names for display purposes.
+SPECIAL_KEY_NAMES = {
+    0: "A", 1: "S", 2: "D", 3: "F", 4: "H", 5: "G", 6: "Z", 7: "X", 8: "C", 9: "V",
+    11: "B", 12: "Q", 13: "W", 14: "E", 15: "R", 16: "Y", 17: "T",
+    18: "1", 19: "2", 20: "3", 21: "4", 22: "6", 23: "5", 24: "=", 25: "9", 26: "7",
+    27: "-", 28: "8", 29: "0", 30: "]", 31: "O", 32: "U", 33: "[", 34: "I", 35: "P",
+    36: "Return", 37: "L", 38: "J", 39: "'", 40: "K", 41: ";", 42: "\\", 43: ",",
+    44: "/", 45: "N", 46: "M", 47: ".", 48: "Tab", 49: "Space", 50: "`", 51: "Delete",
+    53: "Escape",
+    122: "F1", 120: "F2", 99: "F3", 118: "F4", 96: "F5", 97: "F6", 98: "F7",
+    100: "F8", 101: "F9", 109: "F10", 103: "F11", 111: "F12",
+    123: "Left Arrow", 124: "Right Arrow", 125: "Down Arrow", 126: "Up Arrow",
+    115: "Home", 119: "End", 116: "Page Up", 121: "Page Down", 71: "Clear"
+}
+
+# Global variable to hold the callback function during hotkey setup.
+handle_new_toggle_callback = None
+
+def load_custom_toggle_key():
+    """
+    Loads the custom hotkey combination (flags and keycode) from the
+    JSON file specified in `TOGGLE_FILE` (config.py).
+    Updates the global `TOGGLE_KEY` dictionary if a custom hotkey is found.
+    """
+    if TOGGLE_FILE.exists():
+        try:
+            with open(TOGGLE_FILE, "r") as f:
+                data = json.load(f)
+                # Update the global TOGGLE_KEY from config with loaded values
+                TOGGLE_KEY.update({"flags": data["flags"], "key": data["key"]})
+            print(f"Custom launcher toggle loaded: {TOGGLE_KEY}")
+        except Exception as e:
+            print(f"Error loading custom toggle from {TOGGLE_FILE}: {e}", file=sys.stderr)
+
+def get_toggle_string(event, flags, keycode):
+    """
+    Generates a human-readable string representation of a key combination.
+    Example: "Command + Shift + S"
+
+    Args:
+        event (CGEventRef): The CGEvent (used to derive characters for non-special keys).
+        flags (int): The modifier flags (e.g., kCGEventFlagMaskCommand).
+        keycode (int): The virtual keycode.
+
+    Returns:
+        str: A string describing the key combination.
+    """
+    modifiers = []
+    if flags & kCGEventFlagMaskShift:
+        modifiers.append("Shift")
+    if flags & kCGEventFlagMaskControl:
+        modifiers.append("Control")
+    if flags & kCGEventFlagMaskAlternate:
+        modifiers.append("Option")
+    if flags & kCGEventFlagMaskCommand:
+        modifiers.append("Command")
+
+    key_name = SPECIAL_KEY_NAMES.get(keycode)
+
+    if not key_name:
+        # If keycode not in our special map, try to get character from NSEvent
+        # This is a fallback for keys like letters, numbers, symbols not explicitly mapped.
+        ns_event = NSEvent.eventWithCGEvent_(event)
+        if ns_event:
+            char = ns_event.charactersIgnoringModifiers()
+            key_name = char.upper() if char and len(char) > 0 else f"Keycode {keycode}"
+        else:
+            key_name = f"Keycode {keycode}" # Fallback if NSEvent conversion fails
+    
+    return " + ".join(modifiers + [key_name])
+
+class TargetSelectorWrapper(NSObject):
+    """
+    A simple Objective-C wrapper for a Python callable to be used as a target
+    for NSTimer. NSTimer expects an Objective-C object and a selector.
+    """
+    _callback = objc.ivar()
+
+    def initWithCallback_(self, callback):
+        self = objc.super(TargetSelectorWrapper, self).init()
+        if self is None: return None
+        self._callback = callback
+        return self
+    
+    @objc.IBAction
+    def invoke(self, timer):
+        """Called by NSTimer, invokes the stored Python callback."""
+        if self._callback:
+            self._callback()
+
+def set_toggle_window(app_delegate):
+    """
+    Displays an overlay UI prompting the user to press a new key combination
+    for the global hotkey. Handles capturing the new hotkey, saving it,
+    and providing feedback.
+
+    Args:
+        app_delegate (OverlayAppDelegate): The main application delegate instance,
+                                          used to access the main window and its views.
+    """
+    global handle_new_toggle_callback
+
+    if not app_delegate.window:
+        print("Error: Main window not available for setting toggle.", file=sys.stderr)
+        return
+
+    # Ensure the main window is visible and key to receive UI feedback.
+    if not app_delegate.window.isVisible():
+        app_delegate.showWindow_(None)
+    app_delegate.window.makeKeyAndOrderFront_(None)
+
+    print("Initiating launcher toggle configuration. Press Esc to cancel.", flush=True)
+    
+    # Store previous toggle in case of cancellation or error
+    prev_toggle_flags = TOGGLE_KEY.get("flags")
+    prev_toggle_key = TOGGLE_KEY.get("key")
+    
+    # Temporarily disable current hotkey by setting invalid values
+    TOGGLE_KEY["flags"] = -1 
+    TOGGLE_KEY["key"] = -1
+
+    content_view = app_delegate.window.contentView()
+    if not content_view:
+        print("Error: Main window content view not available for setting toggle UI.", file=sys.stderr)
+        # Restore previous toggle if UI setup fails
+        TOGGLE_KEY["flags"] = prev_toggle_flags
+        TOGGLE_KEY["key"] = prev_toggle_key
+        return
+        
+    content_bounds = content_view.bounds()
+
+    # --- UI Setup for "Set Hotkey" Dialog ---
+    # Semi-transparent backdrop
+    backdrop_view = NSView.alloc().initWithFrame_(content_bounds)
+    backdrop_view.setWantsLayer_(True)
+    backdrop_view.layer().setBackgroundColor_(NSColor.colorWithWhite_alpha_(0.5, 0.5).CGColor()) # Dark semi-transparent
+    backdrop_view.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable) # Fill parent
+
+    # Dialog box
+    dialog_width = 420
+    dialog_height = 200
+    dialog_x = (content_bounds.size.width - dialog_width) / 2
+    dialog_y = (content_bounds.size.height - dialog_height) / 2
+    dialog_frame = NSMakeRect(dialog_x, dialog_y, dialog_width, dialog_height)
+    dialog_box = NSView.alloc().initWithFrame_(dialog_frame)
+    dialog_box.setWantsLayer_(True)
+    dialog_box.layer().setBackgroundColor_(NSColor.colorWithWhite_alpha_(0.2, 0.9).CGColor()) # Darker, mostly opaque
+    dialog_box.layer().setCornerRadius_(15)
+    # Center dialog box if window resizes (though unlikely during this modal operation)
+    dialog_box.setAutoresizingMask_(NSViewMinXMargin | NSViewMaxXMargin | NSViewMinYMargin | NSViewMaxYMargin)
+
+    # Instruction text
+    message_text = NSTextField.alloc().initWithFrame_(NSMakeRect(20, 60, dialog_width - 40, 80))
+    message_text.setStringValue_("Press the new toggle key combination.\n(Press Escape to cancel)")
+    message_text.setFont_(NSFont.systemFontOfSize_(16))
+    message_text.setTextColor_(NSColor.whiteColor())
+    message_text.setAlignment_(NSTextAlignmentCenter)
+    message_text.setDrawsBackground_(False)
+    message_text.setBezeled_(False)
+    message_text.setEditable_(False)
+    message_text.setSelectable_(False)
+
+    dialog_box.addSubview_(message_text)
+    backdrop_view.addSubview_(dialog_box)
+    # Add backdrop on top of existing content view's subviews
+    content_view.addSubview_positioned_relativeTo_(backdrop_view, NSWindowAbove, None)
+
+    def new_toggle_handler_inner(event, flags, keycode):
+        """
+        This inner function becomes the temporary event handler when setting a new hotkey.
+        It's assigned to `handle_new_toggle_callback`.
+        """
+        nonlocal prev_toggle_flags, prev_toggle_key
+        global handle_new_toggle_callback
+
+        if keycode == 53:  # Escape key (keycode 53)
+            print("Hotkey configuration aborted by user (Escape pressed).", flush=True)
+            message_text.setStringValue_("Operation cancelled. Reverted to previous hotkey.")
+            # Restore previous hotkey
+            TOGGLE_KEY["flags"] = prev_toggle_flags
+            TOGGLE_KEY["key"] = prev_toggle_key
+        else:
+            # A new hotkey combination was pressed
+            updated_toggle = {"flags": flags, "key": keycode}
+            try:
+                # Save the new hotkey to the JSON file
+                with open(TOGGLE_FILE, "w") as f:
+                    json.dump(updated_toggle, f)
+                TOGGLE_KEY.update(updated_toggle)
+                toggle_str = get_toggle_string(event, flags, keycode)
+                print(f"Launcher toggle updated to: {toggle_str}", flush=True)
+                message_text.setStringValue_(f"New hotkey set:\n{toggle_str}")
+            except Exception as e:
+                print(f"Failed to save new hotkey configuration to {TOGGLE_FILE}: {e}", file=sys.stderr)
+                message_text.setStringValue_("Error saving hotkey! Reverted.")
+                # Restore previous hotkey on error
+                TOGGLE_KEY["flags"] = prev_toggle_flags
+                TOGGLE_KEY["key"] = prev_toggle_key
+
+        # --- Cleanup UI and reset state ---
+        def remove_overlay_and_reset():
+            global handle_new_toggle_callback
+            if backdrop_view and backdrop_view.superview():
+                backdrop_view.removeFromSuperview()
+            handle_new_toggle_callback = None # Crucial: reset event tap to normal operation
+            print(f"Hotkey configuration UI dismissed. Current hotkey: {TOGGLE_KEY}", flush=True)
+            # Return focus to webView if possible
+            if app_delegate and app_delegate.window and app_delegate.webView:
+                app_delegate.window.makeFirstResponder_(app_delegate.webView)
+
+        # Schedule the UI removal and state reset after a short delay to show the message
+        NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
+            1.0, # delay in seconds
+            TargetSelectorWrapper.alloc().initWithCallback_(remove_overlay_and_reset),
+            "invoke", # Selector defined in TargetSelectorWrapper
+            None,     # userInfo
+            False     # repeats: No
+        )
+        return None
+
+    # Set the global callback to our inner handler.
+    # The main event tap listener will now call this function for key down events.
+    handle_new_toggle_callback = new_toggle_handler_inner
+
+def global_toggle_listener(app_shim_instance):
+    """
+    Creates and returns the callback function for the global event tap.
+    This callback handles the global hotkey to toggle the app window
+    and also defers to `handle_new_toggle_callback` if a new hotkey is being set.
+
+    Args:
+        app_shim_instance: An instance of AppEventTapShim, used to interact
+                           with the main application delegate for UI updates.
+
+    Returns:
+        A callable suitable for use as a CGEventTapCallBack.
+    """
+    def tap_event_callback(proxy, type, event, refcon):
+        global handle_new_toggle_callback # To check and call if active
+
+        try:
+            # We are interested in KeyDown events
+            if type == kCGEventKeyDown:
+                keycode = CGEventGetIntegerValueField(event, kCGKeyboardEventKeycode)
+                flags = CGEventGetFlags(event)
+                
+                # Mask the event flags to only include standard modifiers we care about
+                # (Shift, Control, Option, Command) as defined in TOGGLE_KEY_MASK.
+                # This ensures that other flags (like Caps Lock) don't interfere
+                # with hotkey matching unless explicitly part of the saved TOGGLE_KEY["flags"].
+                current_event_modifier_flags = flags & TOGGLE_KEY_MASK
+
+                # If 'set_toggle_window' is active, it sets 'handle_new_toggle_callback'.
+                if handle_new_toggle_callback:
+                    handle_new_toggle_callback(event, current_event_modifier_flags, keycode)
+                    return None
+
+                # Normal operation: check if the pressed key matches the global TOGGLE_KEY
+                if ("key" in TOGGLE_KEY and TOGGLE_KEY.get("key") != -1 and
+                    "flags" in TOGGLE_KEY and
+                    keycode == TOGGLE_KEY["key"] and
+                    current_event_modifier_flags == TOGGLE_KEY["flags"]):
+                    
+                    # print(f"DEBUG: Global hotkey matched: Code={keycode}, Flags={current_event_modifier_flags}", file=sys.stderr)
+                    
+                    if app_shim_instance and \
+                       hasattr(app_shim_instance, '_delegate_instance') and \
+                       app_shim_instance._delegate_instance and \
+                       hasattr(app_shim_instance._delegate_instance, 'toggleWindowVisibility_'):
+                        
+                        app_shim_instance._delegate_instance.performSelectorOnMainThread_withObject_waitUntilDone_(
+                            'toggleWindowVisibility:',
+                            None,
+                            False
+                        )
+                        return None
+            
+            return event
+        
+        except Exception as e:
+            # Log any exception that occurs within the callback to avoid silent failures
+            # and ensure the event tap doesn't get stuck.
+            print(f"CRITICAL ERROR in global_toggle_listener callback: {e}", file=sys.stderr)
+            traceback.print_exc(file=sys.stderr)
+            sys.stderr.flush()
+            return event # Essential to return the event, even on error, to avoid blocking all input
+
+    return tap_event_callback
+</macos_llm_overlay/keyboard.py>
+

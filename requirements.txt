@@ -1,0 +1,11 @@
+# Runtime Dependencies (from setup.py install_requires)
+pyobjc-core
+pyobjc-framework-Cocoa
+pyobjc-framework-WebKit
+pyobjc-framework-Quartz
+pyobjc-framework-ApplicationServices
+jaraco.text
+
+# Build Dependencies (from setup.py setup_requires, needed for py2app build)
+py2app
+setuptools
